@@ -355,7 +355,8 @@ def rule_helper(
             )
             storage.custom_targets.append((rule.target_name, rule.description))
             storage.all_annotators.setdefault(rule.module_name, {}).setdefault(
-                rule.f_name, {"description": rule.description, "annotations": [], "params": param_dict}
+                rule.f_name, {"description": rule.description, "annotations": [], "params": param_dict,
+                               "language": rule.annotator_info["language"]}
             )
             return False
         else:
@@ -426,7 +427,8 @@ def rule_helper(
                 outputs_list.append(output)
                 if rule.annotator:
                     storage.all_annotators.setdefault(rule.module_name, {}).setdefault(
-                        rule.f_name, {"description": rule.description, "annotations": [], "params": param_dict}
+                        rule.f_name, {"description": rule.description, "annotations": [], "params": param_dict,
+                                      "language": rule.annotator_info["language"]}
                     )
                     storage.all_annotators[rule.module_name][rule.f_name]["annotations"].append(
                         (output, output.description)
