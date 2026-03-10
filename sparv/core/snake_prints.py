@@ -168,6 +168,8 @@ def print_modules_info(
                 description = get_custom_module_description(module_name)
             if description:
                 module_data["description"] = description
+            if lang := registry.modules[module_name].language:
+                module_data["language"] = lang
 
             if module_names and selected_modules[module_name]:
                 functions = sorted(f for f in modules[module_name] if f in selected_modules[module_name])
