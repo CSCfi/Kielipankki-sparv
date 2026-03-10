@@ -168,8 +168,6 @@ def print_modules_info(
                 description = get_custom_module_description(module_name)
             if description:
                 module_data["description"] = description
-            if lang := registry.modules[module_name].language:
-                module_data["language"] = lang
 
             if module_names and selected_modules[module_name]:
                 functions = sorted(f for f in modules[module_name] if f in selected_modules[module_name])
@@ -179,6 +177,8 @@ def print_modules_info(
 
             for f_name in functions:
                 f_data = {"description": modules[module_name][f_name]["description"]}
+                if f_lang := modules[module_name][f_name].get("language"):
+                    f_data["language"] = f_lang
 
                 # Get parameters
                 if snake_storage.all_custom_annotators.get(module_name, {}).get(f_name):
