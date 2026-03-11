@@ -51,7 +51,11 @@ class SparvPaths:
         self.config_file = "config.yaml"
 
     def read_sparv_config(self) -> dict:
-        """Get Sparv data path from the config file.
+        """Read Sparv system configuration.
+
+        Reads from ~/.config/sparv/config.yaml (user-level) and, if a data directory
+        is configured, also from $SPARV_DATADIR/config/config.yaml (deployment-level).
+        The deployment-level file takes precedence over the user-level file.
 
         Returns:
             dict: Sparv config data.
@@ -60,9 +64,21 @@ class SparvPaths:
         if self.sparv_config_file.is_file():
             try:
                 with self.sparv_config_file.open(encoding="utf-8") as f:
-                    data = yaml.load(f, Loader=SafeLoader)
+                    data = yaml.load(f, Loader=SafeLoader) or {}
             except Exception:
                 data = {}
+
+        # Also check $SPARV_DATADIR/config/config.yaml, which takes precedence
+        if self.config_dir:
+            deployment_config = self.config_dir / "config.yaml"
+            if deployment_config.is_file():
+                try:
+                    with deployment_config.open(encoding="utf-8") as f:
+                        deployment_data = yaml.load(f, Loader=SafeLoader) or {}
+                    data.update(deployment_data)
+                except Exception:
+                    pass
+
         return data
 
     def get_data_path(self, subpath: str | Path = "") -> Path | None:
