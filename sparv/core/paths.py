@@ -68,9 +68,14 @@ class SparvPaths:
             except Exception:
                 data = {}
 
-        # Also check $SPARV_DATADIR/config/config.yaml, which takes precedence
-        if self.config_dir:
-            deployment_config = self.config_dir / "config.yaml"
+        # Also check $SPARV_DATADIR/config/config.yaml, which takes precedence.
+        # Use self.data_dir if already resolved, otherwise fall back to the env var directly
+        # (self.config_dir cannot be used here as it may not be set yet during __init__).
+        data_dir = self.data_dir or (
+            Path(os.environ[self.data_dir_env]) if os.environ.get(self.data_dir_env) else None
+        )
+        if data_dir:
+            deployment_config = data_dir / "config" / "config.yaml"
             if deployment_config.is_file():
                 try:
                     with deployment_config.open(encoding="utf-8") as f:
