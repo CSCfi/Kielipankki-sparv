@@ -145,6 +145,7 @@ def find_modules(no_import: bool = False, find_custom: bool = False, skip_langua
     core_modules_full_path = paths.sparv_path / paths.core_modules_dir
 
     module_names = []
+    disabled_modules = set(paths.read_sparv_config().get("disabled_modules", []))
 
     for full_path, path, include in (
         (core_modules_full_path, core_modules_path, False),
@@ -152,6 +153,8 @@ def find_modules(no_import: bool = False, find_custom: bool = False, skip_langua
     ):
         found_modules = pkgutil.iter_modules([str(full_path)])
         for module in found_modules:
+            if module.name in disabled_modules:
+                continue
             if include:
                 # Don't include core modules in the returned list of modules, as they are only used for configuration
                 module_names.append(module.name)

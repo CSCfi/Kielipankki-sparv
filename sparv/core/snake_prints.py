@@ -17,6 +17,7 @@ from rich.table import Table
 from sparv.api.util.misc import dump_yaml
 from sparv.core import config, registry, snake_utils
 from sparv.core.console import console
+from sparv.core.paths import paths
 
 
 def prettyprint_yaml(in_dict: dict) -> None:
@@ -45,9 +46,13 @@ def print_modules_summary(snake_storage: snake_utils.SnakeStorage, json_output: 
         "uninstallers": snake_storage.all_uninstallers,
     }
 
+    hidden_modules = set(paths.read_sparv_config().get("hidden_modules", []))
+
     modules_data = {k: {} for k in all_module_types}
     for module_type, modules in all_module_types.items():
         for module_name in sorted(modules.keys()):
+            if module_name in hidden_modules:
+                continue
             if module_name.startswith("custom."):
                 description = get_custom_module_description(module_name)
             else:
@@ -130,6 +135,8 @@ def print_modules_info(
     if not module_types or "all" in module_types:
         module_types = all_module_types.keys()
 
+    hidden_modules = set(paths.read_sparv_config().get("hidden_modules", []))
+
     modules_data = {}
     invalid_modules = set()
     invalid_functions = {}
@@ -145,7 +152,7 @@ def print_modules_info(
         invalid_functions = {k: set(v) for k, v in selected_modules.items()}
 
     for module_type in module_types:
-        modules = all_module_types.get(module_type)
+        modules = {k: v for k, v in all_module_types.get(module_type).items() if k not in hidden_modules}
 
         # Filter modules
         if module_names:
