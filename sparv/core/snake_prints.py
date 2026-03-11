@@ -518,14 +518,17 @@ def print_annotation_classes() -> None:
 
 def print_languages() -> None:
     """Print all supported languages."""
+    disabled_languages = set(paths.read_sparv_config().get("disabled_languages", []))
+
     console.print()
     table = Table(title="Supported languages", box=box.SIMPLE, show_header=False, title_justify="left")
-    full_langs = {k: v for k, v in registry.languages.items() if "-" not in k}
+    full_langs = {k: v for k, v in registry.languages.items() if "-" not in k and k not in disabled_languages}
     for language, name in sorted(full_langs.items(), key=operator.itemgetter(1)):
         table.add_row(name, language)
     console.print(table)
 
-    if sub_langs := {k: v for k, v in registry.languages.items() if "-" in k}:
+    if sub_langs := {k: v for k, v in registry.languages.items()
+                     if "-" in k and k.partition("-")[0] not in disabled_languages}:
         console.print()
         table = Table(title="Supported language varieties", box=box.SIMPLE, show_header=False, title_justify="left")
         table.add_row("[b]Name[/b]", "[b]Language[/b]", "[b]Variety[/b]")
