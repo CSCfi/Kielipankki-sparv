@@ -391,9 +391,13 @@ def build_annotations(
         definition: str | dict = annotation_definitions.get(annotation.name, export_name_cwb)
 
         if isinstance(definition, str):  # Referring to a preset
-            # Check that preset exists
+            # Check that preset exists; if not, try stripping the module namespace
+            # (e.g. "trankit_upos" → "upos") so annotator-agnostic presets are found.
             if definition not in presets:
-                if keep_undefined_annotations:
+                stripped = definition.split("_", 1)[-1] if "_" in definition else definition
+                if stripped in presets:
+                    definition = stripped
+                elif keep_undefined_annotations:
                     definition = {"label": definition.replace("_", " ")}
                 else:
                     logger.warning(
