@@ -42,7 +42,7 @@ def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding):
 # ---------------------------------------------------------------------------
 
 @annotator(
-    "POS, lemma, dependency parsing and NER with Trankit",
+    "POS, lemma and dependency parsing with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
     preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
@@ -91,20 +91,12 @@ def annotate(
         cls="token:dephead",
         description="Absolute dependency head positions from Trankit",
     ),
-    out_ne: Output = Output(
-        "trankit.ne", cls="named_entity", description="Named entity segments from Trankit"
-    ),
-    out_ne_type: Output = Output(
-        "trankit.ne:trankit.ne_type",
-        cls="token:named_entity_type",
-        description="Named entity types from Trankit",
-    ),
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
     pipeline: object = None,  # Injected by the preloader when running under 'sparv preload'
 ):
-    """Annotate corpus with Trankit: tokenization, sentence segmentation, POS, lemma, depparse and NER.
+    """Annotate corpus with Trankit: tokenization, sentence segmentation, POS, lemma and depparse.
 
     Use 'sparv preload' to load the XLM-RoBERTa model once per worker and share
     it across all source files, avoiding a cold start for each file.
@@ -115,8 +107,6 @@ def annotate(
             f"Language '{lang}' is not supported by the trankit annotator. "
             f"Supported languages: {', '.join(_LANG_MAP)}"
         )
-
-    has_ner = trankit_lang in _NER_LANGS
 
     text_data = corpus_text.read()
     text_spans = list(sentence_chunk.read_spans())
@@ -131,7 +121,7 @@ def annotate(
     if not chunks:
         _write_empty_outputs(
             out_sentence, out_token, out_upos, out_pos, out_baseform,
-            out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead, out_ne, out_ne_type,
+            out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
         )
         return
 
@@ -160,8 +150,6 @@ def annotate(
     deprel_list = []
     dephead_ref_list = []
     dephead_list = []
-    ne_segments = []
-    ne_types = []
 
     # global_token_count tracks total tokens written so far, used to compute
     # corpus-absolute dephead values across sentences and chunks.
@@ -192,34 +180,6 @@ def annotate(
                 dephead_ref_list.append(str(head) if head > 0 else "")
                 dephead_list.append(str(head - 1 + global_token_count) if head > 0 else "-")
 
-            # Convert per-token BIO NER tags to span annotations (English only).
-            # For other languages the NE lists stay empty but are still written.
-            if has_ner:
-                ne_start = None
-                ne_type_val = None
-                for token in tokens:
-                    ner_tag = token.get("ner") or "O"
-                    if ner_tag.startswith("B-"):
-                        if ne_start is not None:
-                            ne_segments.append(ne_start)
-                            ne_types.append(ne_type_val)
-                        tok_dspan = token["dspan"]
-                        ne_start = (offset + tok_dspan[0], offset + tok_dspan[1])
-                        ne_type_val = ner_tag[2:]
-                    elif ner_tag.startswith("I-") and ne_start is not None:
-                        tok_dspan = token["dspan"]
-                        ne_start = (ne_start[0], offset + tok_dspan[1])
-                    else:
-                        if ne_start is not None:
-                            ne_segments.append(ne_start)
-                            ne_types.append(ne_type_val)
-                        ne_start = None
-                        ne_type_val = None
-                # Flush any open entity at sentence end
-                if ne_start is not None:
-                    ne_segments.append(ne_start)
-                    ne_types.append(ne_type_val)
-
             global_token_count += sent_len
 
         logger.progress()  # One chunk done
@@ -234,11 +194,104 @@ def annotate(
     out_deprel.write(deprel_list)
     out_dephead_ref.write(dephead_ref_list)
     out_dephead.write(dephead_list)
-    # Always write NE annotations; they will be empty for Finnish and Swedish.
+
+    logger.progress()  # Write step done
+
+
+@annotator(
+    "Named entity recognition with Trankit",
+    language=["eng"],
+    preloader=_preload_pipeline,
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_target="pipeline",
+    preloader_shared=False,
+)
+def annotate_ner(
+    corpus_text: Text = Text(),
+    lang: Language = Language(),
+    sentence_chunk: Annotation = Annotation("[trankit.sentence_chunk]"),
+    out_ne: Output = Output(
+        "trankit.ne", cls="named_entity", description="Named entity segments from Trankit"
+    ),
+    out_ne_type: Output = Output(
+        "trankit.ne:trankit.ne_type",
+        cls="token:named_entity_type",
+        description="Named entity types from Trankit",
+    ),
+    cache_dir: str = Config("trankit.cache_dir"),
+    use_gpu: bool = Config("trankit.use_gpu"),
+    embedding: str = Config("trankit.embedding"),
+    pipeline: object = None,
+):
+    """Named entity recognition with Trankit (English only)."""
+    trankit_lang = _LANG_MAP.get(lang)
+
+    text_data = corpus_text.read()
+    text_spans = list(sentence_chunk.read_spans())
+
+    chunks = [
+        (text_span[0], text_data[text_span[0]:text_span[1]])
+        for text_span in text_spans
+        if text_data[text_span[0]:text_span[1]].strip()
+    ]
+
+    if not chunks:
+        out_ne.write([])
+        out_ne_type.write([])
+        return
+
+    if pipeline is None:
+        try:
+            from trankit import Pipeline
+        except ImportError:
+            raise SparvErrorMessage(
+                "Could not import trankit. Install it into the Sparv virtual environment, "
+                "or run 'sparv preload' to use the preloader."
+            )
+        logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
+        pipeline = _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+
+    logger.progress(total=len(chunks) + 1)
+
+    ne_segments = []
+    ne_types = []
+
+    for offset, chunk_text in chunks:
+        result = pipeline(chunk_text)
+
+        for sent in result.get("sentences", []):
+            tokens = sent.get("tokens", [])
+            ne_start = None
+            ne_type_val = None
+            for token in tokens:
+                ner_tag = token.get("ner") or "O"
+                if ner_tag.startswith("B-"):
+                    if ne_start is not None:
+                        ne_segments.append(ne_start)
+                        ne_types.append(ne_type_val)
+                    tok_dspan = token["dspan"]
+                    ne_start = (offset + tok_dspan[0], offset + tok_dspan[1])
+                    ne_type_val = ner_tag[2:]
+                elif ner_tag.startswith("I-") and ne_start is not None:
+                    tok_dspan = token["dspan"]
+                    ne_start = (ne_start[0], offset + tok_dspan[1])
+                else:
+                    if ne_start is not None:
+                        ne_segments.append(ne_start)
+                        ne_types.append(ne_type_val)
+                    ne_start = None
+                    ne_type_val = None
+            # Flush any open entity at sentence end
+            if ne_start is not None:
+                ne_segments.append(ne_start)
+                ne_types.append(ne_type_val)
+
+        logger.progress()
+
     out_ne.write(ne_segments)
     out_ne_type.write(ne_types)
 
-    logger.progress()  # Write step done
+    logger.progress()
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +300,11 @@ def annotate(
 
 def _write_empty_outputs(
     out_sentence, out_token, out_upos, out_pos, out_baseform,
-    out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead, out_ne, out_ne_type,
+    out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
 ):
     """Write empty annotation lists when there is no input text."""
     for output in (
         out_sentence, out_token, out_upos, out_pos, out_baseform,
-        out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead, out_ne, out_ne_type,
+        out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
     ):
         output.write([])
