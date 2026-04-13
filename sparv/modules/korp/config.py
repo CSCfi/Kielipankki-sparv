@@ -528,16 +528,11 @@ def get_corpus_name(
                 if source.get(lang):  # Ignore empty strings
                     corpus_name[lang] = source[lang]
             if corpus_name:
-                # Fill in missing languages
+                # Fill in missing languages using first available name
                 first_value = next(iter(corpus_name.values()))
                 for lang in languages:
                     if lang not in corpus_name:
                         corpus_name[lang] = first_value
-                        logger.warning(
-                            "Corpus name for language %r not found. Using name from another language: %r",
-                            lang,
-                            first_value,
-                        )
                 return corpus_name
     # Fallback to corpus_id
     logger.warning("No corpus name specified ('metadata.name'). Using corpus ID as name.")
