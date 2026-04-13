@@ -1,6 +1,17 @@
 """POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
 
+import os
 import warnings
+
+# Put HuggingFace into offline mode before trankit (and therefore transformers /
+# huggingface_hub) is imported anywhere. The trankit plugin pre-fetches all the
+# models it needs during provisioning, so at runtime there is nothing legitimate
+# to download — but transformers will otherwise still issue cache-revalidation
+# HEAD requests to huggingface.co for files like xlm-roberta-base/config.json,
+# which stall for ~50s per file when the network is flaky. setdefault leaves an
+# escape hatch for the provisioning job to override with HF_HUB_OFFLINE=0.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 from sparv.api import Annotation, Config, Language, Output, SparvErrorMessage, Text, annotator, get_logger
 
