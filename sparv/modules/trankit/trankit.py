@@ -142,12 +142,26 @@ def tokenize(
             continue
 
         for sent in result.get("sentences", []):
-            sent_dspan = sent.get("dspan", [0, 0])
-            sentence_segments.append((offset + sent_dspan[0], offset + sent_dspan[1]))
-
+            # Trankit's token dspans occasionally include surrounding whitespace
+            # (notably a trailing newline in hard-wrapped text) or even span
+            # internal whitespace. A token containing whitespace breaks every
+            # downstream consumer that assumes a token holds none — most visibly
+            # TreeTagger, which receives tokens newline-separated and would then
+            # emit more rows than it was given. Normalise each token span to
+            # maximal runs of non-whitespace characters.
+            sent_tokens = []
             for token in sent.get("tokens", []):
                 tok_dspan = token.get("dspan", [0, 0])
-                token_segments.append((offset + tok_dspan[0], offset + tok_dspan[1]))
+                sent_tokens.extend(
+                    _clean_token_spans(text_data, offset + tok_dspan[0], offset + tok_dspan[1])
+                )
+
+            if not sent_tokens:
+                continue  # Skip sentences with no actual tokens (e.g. whitespace only)
+
+            sent_dspan = sent.get("dspan", [0, 0])
+            sentence_segments.append((offset + sent_dspan[0], offset + sent_dspan[1]))
+            token_segments.extend(sent_tokens)
 
         logger.progress()  # One chunk done
 
@@ -366,6 +380,29 @@ def annotate_ner(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _clean_token_spans(text, start, end):
+    """Yield (start, end) sub-spans covering maximal runs of non-whitespace in text[start:end].
+
+    Trankit token dspans sometimes include leading/trailing whitespace (notably a
+    trailing newline in hard-wrapped source text) or even span internal whitespace.
+    Emitting such a span as a single token breaks every downstream consumer that
+    assumes a token holds no whitespace — most visibly TreeTagger, which receives
+    tokens newline-separated and would then emit more rows than it was given.
+    Splitting on whitespace here keeps `trankit.token` whitespace-free by
+    construction; an all-whitespace span yields nothing and is dropped.
+    """
+    i = start
+    while i < end:
+        while i < end and text[i].isspace():
+            i += 1
+        if i >= end:
+            break
+        run_start = i
+        while i < end and not text[i].isspace():
+            i += 1
+        yield (run_start, i)
+
 
 def _model_token(text):
     """Return token text as fed to Trankit; it rejects empty/whitespace-only tokens."""
