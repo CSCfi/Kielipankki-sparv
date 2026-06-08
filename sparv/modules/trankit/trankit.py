@@ -42,22 +42,40 @@ _LANG_MAP = {
 # Preloader
 # ---------------------------------------------------------------------------
 
-def _preload_pipeline(lang, cache_dir, use_gpu, embedding):
+def _set_torch_threads(use_gpu, threads):
+    """Set the CPU thread count for Trankit's torch inference.
+
+    Sparv runs each annotator as a Snakemake job, and Snakemake exports
+    OMP_NUM_THREADS set to the rule's thread count (1 by default), which would
+    otherwise pin Trankit's transformer inference to a single core. torch's
+    runtime set_num_threads takes precedence over that inherited value. `threads`
+    of 0 means "use all available cores". No effect when running on GPU.
+    """
+    if use_gpu:
+        return
+    import torch
+    n = threads or os.cpu_count() or 1
+    torch.set_num_threads(n)
+    logger.info("Using %d CPU thread(s) for Trankit inference", n)
+
+
+def _preload_pipeline(lang, cache_dir, use_gpu, embedding, threads):
     """Load the Trankit Pipeline once per worker for reuse across all source files."""
     from trankit import Pipeline
     trankit_lang = _LANG_MAP.get(lang)
     logger.info("Preloading Trankit pipeline for language '%s'", trankit_lang)
-    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads)
 
 
-def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding):
+def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads):
     """Construct a Pipeline while suppressing noisy third-party FutureWarnings."""
+    _set_torch_threads(use_gpu, threads)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
         return Pipeline(trankit_lang, gpu=use_gpu, cache_dir=cache_dir, embedding=embedding)
 
 
-def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding):
+def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads):
     """Return the preloaded pipeline, or load one (cold start for this file)."""
     trankit_lang = _LANG_MAP.get(lang)
     if trankit_lang is None:
@@ -75,7 +93,7 @@ def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding):
             "or run 'sparv preload' to use the preloader."
         )
     logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
-    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +104,7 @@ def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding):
     "Sentence segmentation and tokenization with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
     preloader_target="pipeline",
     preloader_shared=False,  # Each worker loads its own copy; safer with PyTorch/CUDA
 )
@@ -103,6 +121,7 @@ def tokenize(
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
+    threads: int = Config("trankit.threads"),
     pipeline: object = None,  # Injected by the preloader when running under 'sparv preload'
 ):
     """Segment text into sentences and tokens with Trankit.
@@ -127,7 +146,7 @@ def tokenize(
         out_token.write([])
         return
 
-    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding)
+    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
 
     # Progress bar: one step per chunk, plus one for the final write.
     logger.progress(total=len(chunks) + 1)
@@ -175,7 +194,7 @@ def tokenize(
     "POS, lemma and dependency parsing with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
     preloader_target="pipeline",
     preloader_shared=False,
 )
@@ -219,6 +238,7 @@ def annotate(
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
+    threads: int = Config("trankit.threads"),
     pipeline: object = None,
 ):
     """POS tag, lemmatize and dependency parse existing tokens with Trankit.
@@ -249,7 +269,7 @@ def annotate(
     pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
     if pretokenized:
-        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding)
+        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
 
         # Progress bar: tagging/parsing, lemmatization, writing.
         logger.progress(total=3)
@@ -294,7 +314,7 @@ def annotate(
     "Named entity recognition with Trankit",
     language=["eng"],  # Of our languages, only English has a Trankit NER model
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
     preloader_target="pipeline",
     preloader_shared=False,
 )
@@ -314,6 +334,7 @@ def annotate_ner(
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
+    threads: int = Config("trankit.threads"),
     pipeline: object = None,
 ):
     """Named entity recognition with Trankit (English only).
@@ -335,7 +356,7 @@ def annotate_ner(
         out_ne_type.write([])
         return
 
-    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding)
+    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
 
     # Progress bar: NER tagging, writing.
     logger.progress(total=2)
