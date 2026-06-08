@@ -60,6 +60,8 @@ def _set_torch_threads(use_gpu, threads):
     if use_gpu and torch.cuda.is_available():
         return  # Actually running on GPU; CPU thread count is irrelevant.
     n = threads or os.cpu_count() or 1
+    if n > 1: # Let's leave a spare thread for mink-backend while they share machines
+        n -= 1
     torch.set_num_threads(n)
     logger.info("Using %d CPU thread(s) for Trankit inference", n)
 
