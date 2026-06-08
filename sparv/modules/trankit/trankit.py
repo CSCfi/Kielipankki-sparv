@@ -49,11 +49,16 @@ def _set_torch_threads(use_gpu, threads):
     OMP_NUM_THREADS set to the rule's thread count (1 by default), which would
     otherwise pin Trankit's transformer inference to a single core. torch's
     runtime set_num_threads takes precedence over that inherited value. `threads`
-    of 0 means "use all available cores". No effect when running on GPU.
+    of 0 means "use all available cores".
+
+    Gated on actual CUDA availability, not the `use_gpu` config flag: Trankit
+    treats `use_gpu` as best-effort and silently falls back to CPU when CUDA is
+    absent (the common case here), so keying off the flag would skip the thread
+    setting on exactly the CPU-only hosts that need it.
     """
-    if use_gpu:
-        return
     import torch
+    if use_gpu and torch.cuda.is_available():
+        return  # Actually running on GPU; CPU thread count is irrelevant.
     n = threads or os.cpu_count() or 1
     torch.set_num_threads(n)
     logger.info("Using %d CPU thread(s) for Trankit inference", n)
