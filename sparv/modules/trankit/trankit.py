@@ -66,23 +66,30 @@ def _set_torch_threads(use_gpu, threads):
     logger.info("Using %d CPU thread(s) for Trankit inference", n)
 
 
-def _preload_pipeline(lang, cache_dir, use_gpu, embedding, threads):
+def _preload_pipeline(lang, cache_dir, use_gpu, embedding, threads, tok_batch_size):
     """Load the Trankit Pipeline once per worker for reuse across all source files."""
     from trankit import Pipeline
     trankit_lang = _LANG_MAP.get(lang)
     logger.info("Preloading Trankit pipeline for language '%s'", trankit_lang)
-    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size)
 
 
-def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads):
+def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size):
     """Construct a Pipeline while suppressing noisy third-party FutureWarnings."""
     _set_torch_threads(use_gpu, threads)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
-        return Pipeline(trankit_lang, gpu=use_gpu, cache_dir=cache_dir, embedding=embedding)
+        pipeline = Pipeline(trankit_lang, gpu=use_gpu, cache_dir=cache_dir, embedding=embedding)
+    if tok_batch_size:
+        # Trankit hardcodes the tokenizer batch size to 2 on CPU (tbname2tokbatchsize is
+        # empty, so it falls back to the instance attribute). Tokenization dominates CPU
+        # runtime, so override it to trade memory for fewer, larger transformer passes.
+        pipeline._tokbatchsize = tok_batch_size
+        logger.info("Using Trankit tokenizer batch size %d", tok_batch_size)
+    return pipeline
 
 
-def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads):
+def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size):
     """Return the preloaded pipeline, or load one (cold start for this file)."""
     trankit_lang = _LANG_MAP.get(lang)
     if trankit_lang is None:
@@ -100,7 +107,7 @@ def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads):
             "or run 'sparv preload' to use the preloader."
         )
     logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
-    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,7 @@ def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads):
     "Sentence segmentation and tokenization with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
     preloader_target="pipeline",
     preloader_shared=False,  # Each worker loads its own copy; safer with PyTorch/CUDA
 )
@@ -129,6 +136,7 @@ def tokenize(
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
     threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
     pipeline: object = None,  # Injected by the preloader when running under 'sparv preload'
 ):
     """Segment text into sentences and tokens with Trankit.
@@ -153,7 +161,7 @@ def tokenize(
         out_token.write([])
         return
 
-    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
+    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
     # Progress bar: one step per chunk, plus one for the final write.
     logger.progress(total=len(chunks) + 1)
@@ -201,7 +209,7 @@ def tokenize(
     "POS, lemma and dependency parsing with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
     preloader_target="pipeline",
     preloader_shared=False,
 )
@@ -246,6 +254,7 @@ def annotate(
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
     threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
     pipeline: object = None,
 ):
     """POS tag, lemmatize and dependency parse existing tokens with Trankit.
@@ -276,7 +285,7 @@ def annotate(
     pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
     if pretokenized:
-        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
+        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
         # Progress bar: tagging/parsing, lemmatization, writing.
         logger.progress(total=3)
@@ -321,7 +330,7 @@ def annotate(
     "Named entity recognition with Trankit",
     language=["eng"],  # Of our languages, only English has a Trankit NER model
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
     preloader_target="pipeline",
     preloader_shared=False,
 )
@@ -342,6 +351,7 @@ def annotate_ner(
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
     threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
     pipeline: object = None,
 ):
     """Named entity recognition with Trankit (English only).
@@ -363,7 +373,7 @@ def annotate_ner(
         out_ne_type.write([])
         return
 
-    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads)
+    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
     # Progress bar: NER tagging, writing.
     logger.progress(total=2)

@@ -39,4 +39,13 @@ __config__ = [
         description="XLM-RoBERTa embedding variant to use ('xlm-roberta-base' or 'xlm-roberta-large')",
         datatype=str,
     ),
+    Config(
+        "trankit.tok_batch_size",
+        default=8,
+        description="Batch size for Trankit's tokenizer (number of ~400-token windows per "
+        "transformer forward pass). Trankit hardcodes 2 on CPU; raising it trades memory for "
+        "fewer, larger passes and may speed up tokenization, which dominates CPU runtime. "
+        "0 keeps Trankit's built-in default. Experimental — measure before relying on it.",
+        datatype=int,
+    ),
 ]
