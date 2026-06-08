@@ -1,4 +1,4 @@
-"""POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
+"""Tokenization, POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
 
 from sparv.api import Config
 
