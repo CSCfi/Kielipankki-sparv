@@ -339,13 +339,10 @@ def annotate_ner(
     word: Annotation = Annotation("<token:word>"),
     sentence: Annotation = Annotation("<sentence>"),
     token: Annotation = Annotation("<token>"),
-    out_ne: Output = Output(
-        "trankit.ne", cls="named_entity", description="Named entity segments from Trankit"
-    ),
     out_ne_type: Output = Output(
-        "trankit.ne:trankit.ne_type",
+        "<token>:trankit.ne_type",
         cls="token:named_entity_type",
-        description="Named entity types from Trankit",
+        description="Named entity type per token from Trankit (OntoNotes tags; '_' outside entities)",
     ),
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
@@ -356,63 +353,41 @@ def annotate_ner(
 ):
     """Named entity recognition with Trankit (English only).
 
-    Reads the corpus tokenization (`<token>` grouped by `<sentence>`) and runs
-    only Trankit's NER component on it, building entity spans from the BIO tag
-    sequence over the token spans.
+    Reads the corpus tokenization (`<token>` grouped by `<sentence>`), runs only
+    Trankit's NER component, and writes a *per-token* entity type. This is a
+    positional (token-level) attribute, matching the NER convention of the
+    Kielipankki Korp corpora (a `ne_type` word attribute) rather than a
+    structural span — so it surfaces as a word annotation and in Korp's attribute
+    selectors. Trankit emits BIO tags (e.g. "B-PERSON"); the B-/I- prefix is
+    stripped to the bare type and tokens outside any entity get "_".
     """
     sentences_all, _orphans = sentence.get_children(token)
 
     word_list = list(word.read())
-    token_spans = list(token.read_spans())
-
     sentences = [s for s in sentences_all if s]
     pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
-    if not pretokenized:
-        out_ne.write([])
-        out_ne_type.write([])
-        return
+    # One value per token; non-entity tokens (and any sentence-less orphans) keep "_".
+    ne_type = ["_"] * len(word_list)
 
-    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
+    if pretokenized:
+        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
-    # Progress bar: NER tagging, writing.
-    logger.progress(total=2)
+        # Progress bar: NER tagging, writing.
+        logger.progress(total=2)
 
-    ner_doc = pipeline.ner(pretokenized)["sentences"]
-    logger.progress()
+        ner_doc = pipeline.ner(pretokenized)["sentences"]
+        logger.progress()
 
-    ne_segments = []
-    ne_types = []
+        for sent, ner_sent in zip(sentences, ner_doc, strict=True):
+            for w_index, w in zip(sent, ner_sent["tokens"], strict=True):
+                ner_tag = w.get("ner") or "O"
+                ne_type[w_index] = ner_tag.split("-", 1)[-1] if ner_tag != "O" else "_"
 
-    for sent, ner_sent in zip(sentences, ner_doc, strict=True):
-        ne_start = None
-        ne_type_val = None
-        for w_index, w in zip(sent, ner_sent["tokens"], strict=True):
-            ner_tag = w.get("ner") or "O"
-            tok_span = token_spans[w_index]
-            if ner_tag.startswith("B-"):
-                if ne_start is not None:
-                    ne_segments.append(ne_start)
-                    ne_types.append(ne_type_val)
-                ne_start = (tok_span[0], tok_span[1])
-                ne_type_val = ner_tag[2:]
-            elif ner_tag.startswith("I-") and ne_start is not None:
-                ne_start = (ne_start[0], tok_span[1])
-            else:
-                if ne_start is not None:
-                    ne_segments.append(ne_start)
-                    ne_types.append(ne_type_val)
-                ne_start = None
-                ne_type_val = None
-        # Flush any open entity at sentence end
-        if ne_start is not None:
-            ne_segments.append(ne_start)
-            ne_types.append(ne_type_val)
+    out_ne_type.write(ne_type)
 
-    out_ne.write(ne_segments)
-    out_ne_type.write(ne_types)
-
-    logger.progress()
+    if pretokenized:
+        logger.progress()  # Write step done
 
 
 # ---------------------------------------------------------------------------
