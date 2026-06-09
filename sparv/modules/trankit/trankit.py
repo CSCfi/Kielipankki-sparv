@@ -342,7 +342,13 @@ def annotate_ner(
     out_ne_type: Output = Output(
         "<token>:trankit.ne_type",
         cls="token:named_entity_type",
-        description="Named entity type per token from Trankit (OntoNotes tags; '_' outside entities)",
+        description="Named entity type per token from Trankit (bare type, e.g. PER/ORG/LOC/MISC; "
+        "empty outside entities)",
+    ),
+    out_ne_part: Output = Output(
+        "<token>:trankit.ne_part",
+        description="Named entity part per token from Trankit: the BIOES position prefix "
+        "(B=begin, I=inside, E=end, S=single); empty outside entities — encodes span boundaries",
     ),
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
@@ -354,12 +360,16 @@ def annotate_ner(
     """Named entity recognition with Trankit (English only).
 
     Reads the corpus tokenization (`<token>` grouped by `<sentence>`), runs only
-    Trankit's NER component, and writes a *per-token* entity type. This is a
-    positional (token-level) attribute, matching the NER convention of the
-    Kielipankki Korp corpora (a `ne_type` word attribute) rather than a
-    structural span — so it surfaces as a word annotation and in Korp's attribute
-    selectors. Trankit emits BIO tags (e.g. "B-PERSON"); the B-/I- prefix is
-    stripped to the bare type and tokens outside any entity get "_".
+    Trankit's NER component, and writes two *per-token* (positional) attributes —
+    matching the Kielipankki Korp NER convention (word attributes) rather than a
+    structural span:
+
+    - `ne_type`: the bare entity type (e.g. "PER", "MISC").
+    - `ne_part`: the BIOES position prefix ("B"/"I"/"E"/"S"), which encodes span
+      boundaries (B/S start an entity, E/S end one).
+
+    Both are empty for tokens outside any entity, so Korp renders them as empty
+    (a dim ∅) rather than a placeholder string.
     """
     sentences_all, _orphans = sentence.get_children(token)
 
@@ -367,8 +377,10 @@ def annotate_ner(
     sentences = [s for s in sentences_all if s]
     pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
-    # One value per token; non-entity tokens (and any sentence-less orphans) keep "_".
-    ne_type = ["_"] * len(word_list)
+    # One value per token; tokens outside any entity (and sentence-less orphans)
+    # stay empty.
+    ne_type = [""] * len(word_list)
+    ne_part = [""] * len(word_list)
 
     if pretokenized:
         pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
@@ -382,9 +394,19 @@ def annotate_ner(
         for sent, ner_sent in zip(sentences, ner_doc, strict=True):
             for w_index, w in zip(sent, ner_sent["tokens"], strict=True):
                 ner_tag = w.get("ner") or "O"
-                ne_type[w_index] = ner_tag.split("-", 1)[-1] if ner_tag != "O" else "_"
+                if ner_tag == "O":
+                    continue
+                # Trankit emits BIOES tags like "B-PER"; split into prefix + type.
+                if "-" in ner_tag:
+                    prefix, _, ne_t = ner_tag.partition("-")
+                    ne_part[w_index] = prefix
+                    ne_type[w_index] = ne_t
+                else:
+                    # Unexpected: a non-O tag without a BIOES prefix; treat as the type.
+                    ne_type[w_index] = ner_tag
 
     out_ne_type.write(ne_type)
+    out_ne_part.write(ne_part)
 
     if pretokenized:
         logger.progress()  # Write step done
