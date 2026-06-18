@@ -1,4 +1,17 @@
-"""POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
+"""Tokenization, POS tagging, lemmatisation, dependency parsing and NER with Trankit.
+
+The module is split into three annotators so that tokenization is done exactly
+once, by Trankit, and every downstream annotator works on that tokenization:
+
+- `tokenize` produces `trankit.sentence` and `trankit.token` from the source
+  text (the corpus config is expected to bind the `sentence` and `token`
+  classes to these).
+- `annotate` and `annotate_ner` read the existing `<sentence>`/`<token>`
+  annotations and feed Trankit *pretokenized* input, so their output
+  attributes are aligned with `<token>` by construction. (A previous version
+  let Trankit re-tokenize the text internally, which produced attribute lists
+  of a different length than the token annotation and broke the exports.)
+"""
 
 import os
 import warnings
@@ -24,52 +37,187 @@ _LANG_MAP = {
     "swe": "swedish",
 }
 
-# Subset of our supported languages that have a trained NER model in Trankit.
-# Finnish and Swedish are not in Trankit's `langwithner` set.
-_NER_LANGS = {"english"}
-
 
 # ---------------------------------------------------------------------------
 # Preloader
 # ---------------------------------------------------------------------------
 
-def _preload_pipeline(lang, cache_dir, use_gpu, embedding):
+def _set_torch_threads(use_gpu, threads):
+    """Set the CPU thread count for Trankit's torch inference.
+
+    Sparv runs each annotator as a Snakemake job, and Snakemake exports
+    OMP_NUM_THREADS set to the rule's thread count (1 by default), which would
+    otherwise pin Trankit's transformer inference to a single core. torch's
+    runtime set_num_threads takes precedence over that inherited value. `threads`
+    of 0 means "use all available cores".
+
+    Gated on actual CUDA availability, not the `use_gpu` config flag: Trankit
+    treats `use_gpu` as best-effort and silently falls back to CPU when CUDA is
+    absent (the common case here), so keying off the flag would skip the thread
+    setting on exactly the CPU-only hosts that need it.
+    """
+    import torch
+    if use_gpu and torch.cuda.is_available():
+        return  # Actually running on GPU; CPU thread count is irrelevant.
+    n = threads or os.cpu_count() or 1
+    if n > 1: # Let's leave a spare thread for mink-backend while they share machines
+        n -= 1
+    torch.set_num_threads(n)
+    logger.info("Using %d CPU thread(s) for Trankit inference", n)
+
+
+def _preload_pipeline(lang, cache_dir, use_gpu, embedding, threads, tok_batch_size):
     """Load the Trankit Pipeline once per worker for reuse across all source files."""
     from trankit import Pipeline
     trankit_lang = _LANG_MAP.get(lang)
     logger.info("Preloading Trankit pipeline for language '%s'", trankit_lang)
-    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size)
 
 
-def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding):
+def _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size):
     """Construct a Pipeline while suppressing noisy third-party FutureWarnings."""
+    _set_torch_threads(use_gpu, threads)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
-        return Pipeline(trankit_lang, gpu=use_gpu, cache_dir=cache_dir, embedding=embedding)
+        pipeline = Pipeline(trankit_lang, gpu=use_gpu, cache_dir=cache_dir, embedding=embedding)
+    if tok_batch_size:
+        # Trankit hardcodes the tokenizer batch size to 2 on CPU (tbname2tokbatchsize is
+        # empty, so it falls back to the instance attribute). Tokenization dominates CPU
+        # runtime, so override it to trade memory for fewer, larger transformer passes.
+        pipeline._tokbatchsize = tok_batch_size
+        logger.info("Using Trankit tokenizer batch size %d", tok_batch_size)
+    return pipeline
+
+
+def _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size):
+    """Return the preloaded pipeline, or load one (cold start for this file)."""
+    trankit_lang = _LANG_MAP.get(lang)
+    if trankit_lang is None:
+        raise SparvErrorMessage(
+            f"Language '{lang}' is not supported by the trankit annotator. "
+            f"Supported languages: {', '.join(_LANG_MAP)}"
+        )
+    if pipeline is not None:
+        return pipeline
+    try:
+        from trankit import Pipeline
+    except ImportError:
+        raise SparvErrorMessage(
+            "Could not import trankit. Install it into the Sparv virtual environment, "
+            "or run 'sparv preload' to use the preloader."
+        )
+    logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
+    return _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding, threads, tok_batch_size)
 
 
 # ---------------------------------------------------------------------------
-# Annotator
+# Annotators
 # ---------------------------------------------------------------------------
 
 @annotator(
-    "POS, lemma and dependency parsing with Trankit",
+    "Sentence segmentation and tokenization with Trankit",
     language=["eng", "fin", "swe"],
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
     preloader_target="pipeline",
     preloader_shared=False,  # Each worker loads its own copy; safer with PyTorch/CUDA
 )
-def annotate(
+def tokenize(
     corpus_text: Text = Text(),
     lang: Language = Language(),
-    sentence_chunk: Annotation = Annotation("[trankit.sentence_chunk]"),
+    chunk: Annotation = Annotation("[trankit.sentence_chunk]"),
     out_sentence: Output = Output(
         "trankit.sentence", cls="sentence", description="Sentence segments from Trankit"
     ),
     out_token: Output = Output(
         "trankit.token", cls="token", description="Token segments from Trankit"
     ),
+    cache_dir: str = Config("trankit.cache_dir"),
+    use_gpu: bool = Config("trankit.use_gpu"),
+    embedding: str = Config("trankit.embedding"),
+    threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
+    pipeline: object = None,  # Injected by the preloader when running under 'sparv preload'
+):
+    """Segment text into sentences and tokens with Trankit.
+
+    This is the only annotator that runs Trankit on raw text; `annotate` and
+    `annotate_ner` consume the resulting tokenization. Use 'sparv preload' to
+    load the XLM-RoBERTa model once per worker and share it across all source
+    files, avoiding a cold start for each file.
+    """
+    text_data = corpus_text.read()
+    text_spans = list(chunk.read_spans())
+
+    # Collect non-empty chunks with their corpus offsets.
+    chunks = [
+        (text_span[0], text_data[text_span[0]:text_span[1]])
+        for text_span in text_spans
+        if text_data[text_span[0]:text_span[1]].strip()
+    ]
+
+    if not chunks:
+        out_sentence.write([])
+        out_token.write([])
+        return
+
+    pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
+
+    # Progress bar: one step per chunk, plus one for the final write.
+    logger.progress(total=len(chunks) + 1)
+
+    sentence_segments = []
+    token_segments = []
+
+    for offset, chunk_text in chunks:
+        result = pipeline.tokenize(chunk_text)
+        if not result:
+            logger.progress()
+            continue
+
+        for sent in result.get("sentences", []):
+            # Trankit's token dspans occasionally include surrounding whitespace
+            # (notably a trailing newline in hard-wrapped text) or even span
+            # internal whitespace. A token containing whitespace breaks every
+            # downstream consumer that assumes a token holds none — most visibly
+            # TreeTagger, which receives tokens newline-separated and would then
+            # emit more rows than it was given. Normalise each token span to
+            # maximal runs of non-whitespace characters.
+            sent_tokens = []
+            for token in sent.get("tokens", []):
+                tok_dspan = token.get("dspan", [0, 0])
+                sent_tokens.extend(
+                    _clean_token_spans(text_data, offset + tok_dspan[0], offset + tok_dspan[1])
+                )
+
+            if not sent_tokens:
+                continue  # Skip sentences with no actual tokens (e.g. whitespace only)
+
+            sent_dspan = sent.get("dspan", [0, 0])
+            sentence_segments.append((offset + sent_dspan[0], offset + sent_dspan[1]))
+            token_segments.extend(sent_tokens)
+
+        logger.progress()  # One chunk done
+
+    out_sentence.write(sentence_segments)
+    out_token.write(token_segments)
+
+    logger.progress()  # Write step done
+
+
+@annotator(
+    "POS, lemma and dependency parsing with Trankit",
+    language=["eng", "fin", "swe"],
+    preloader=_preload_pipeline,
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
+    preloader_target="pipeline",
+    preloader_shared=False,
+)
+def annotate(
+    lang: Language = Language(),
+    word: Annotation = Annotation("<token:word>"),
+    sentence: Annotation = Annotation("<sentence>"),
+    token: Annotation = Annotation("<token>"),
     out_upos: Output = Output(
         "<token>:trankit.upos", cls="token:upos", description="Universal POS tags from Trankit"
     ),
@@ -105,217 +253,192 @@ def annotate(
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
-    pipeline: object = None,  # Injected by the preloader when running under 'sparv preload'
+    threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
+    pipeline: object = None,
 ):
-    """Annotate corpus with Trankit: tokenization, sentence segmentation, POS, lemma and depparse.
+    """POS tag, lemmatize and dependency parse existing tokens with Trankit.
 
-    Use 'sparv preload' to load the XLM-RoBERTa model once per worker and share
-    it across all source files, avoiding a cold start for each file.
+    Reads the corpus tokenization (`<token>` grouped by `<sentence>`, normally
+    produced by `trankit:tokenize`) and feeds it to Trankit pretokenized, so
+    every output attribute has exactly one value per token.
     """
-    trankit_lang = _LANG_MAP.get(lang)
-    if trankit_lang is None:
-        raise SparvErrorMessage(
-            f"Language '{lang}' is not supported by the trankit annotator. "
-            f"Supported languages: {', '.join(_LANG_MAP)}"
+    sentences_all, orphans = sentence.get_children(token)
+    if orphans:
+        logger.warning(
+            "Found %d tokens not belonging to any sentence. These will not be annotated.",
+            len(orphans),
         )
 
-    text_data = corpus_text.read()
-    text_spans = list(sentence_chunk.read_spans())
+    word_list = list(word.read())
 
-    # Collect non-empty chunks with their corpus offsets.
-    chunks = [
-        (text_span[0], text_data[text_span[0]:text_span[1]])
-        for text_span in text_spans
-        if text_data[text_span[0]:text_span[1]].strip()
-    ]
+    upos = word.create_empty_attribute()
+    pos = word.create_empty_attribute()
+    baseform = word.create_empty_attribute()
+    feats = word.create_empty_attribute()
+    ref = word.create_empty_attribute()
+    deprel = word.create_empty_attribute()
+    dephead_ref = word.create_empty_attribute()
+    dephead = word.create_empty_attribute()
 
-    if not chunks:
-        _write_empty_outputs(
-            out_sentence, out_token, out_upos, out_pos, out_baseform,
-            out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
-        )
-        return
+    sentences = [s for s in sentences_all if s]
+    pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
-    # Load pipeline if the preloader wasn't used (cold start for this file).
-    if pipeline is None:
-        try:
-            from trankit import Pipeline
-        except ImportError:
-            raise SparvErrorMessage(
-                "Could not import trankit. Install it into the Sparv virtual environment, "
-                "or run 'sparv preload' to use the preloader."
-            )
-        logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
-        pipeline = _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+    if pretokenized:
+        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
-    # Progress bar: one step per chunk, plus one for the final write.
-    logger.progress(total=len(chunks) + 1)
+        # Progress bar: tagging/parsing, lemmatization, writing.
+        logger.progress(total=3)
 
-    sentence_segments = []
-    token_segments = []
-    upos_list = []
-    pos_list = []
-    baseform_list = []
-    feats_list = []
-    ref_list = []
-    deprel_list = []
-    dephead_ref_list = []
-    dephead_list = []
+        tagged_doc = pipeline.posdep(pretokenized)["sentences"]
+        logger.progress()
 
-    # global_token_count tracks total tokens written so far, used to compute
-    # corpus-absolute dephead values across sentences and chunks.
-    global_token_count = 0
+        # The public lemmatize() entry point discards POS tags for pretokenized
+        # input (obmit_tag=True), which degrades lemmas for ambiguous word
+        # forms. Chain the tagger output into the lemmatizer the same way
+        # Pipeline.__call__ does, keeping tag-conditioned lemmatization.
+        tagged_doc = pipeline._lemmatize_doc(tagged_doc)
+        logger.progress()
 
-    for offset, chunk_text in chunks:
-        result = pipeline(chunk_text)
+        for sent, tagged_sent in zip(sentences, tagged_doc, strict=True):
+            for w_index, w in zip(sent, tagged_sent["tokens"], strict=True):
+                upos[w_index] = w.get("upos") or "_"
+                pos[w_index] = w.get("xpos") or "_"
+                baseform[w_index] = w.get("lemma") or "_"
+                feats[w_index] = w.get("feats") or "_"
+                ref[w_index] = str(w.get("id", ""))
+                deprel[w_index] = w.get("deprel") or "_"
 
-        for sent in result.get("sentences", []):
-            sent_dspan = sent.get("dspan", [0, 0])
-            sentence_segments.append((offset + sent_dspan[0], offset + sent_dspan[1]))
+                head = w.get("head") or 0
+                dephead_ref[w_index] = str(head) if head > 0 else ""
+                dephead[w_index] = str(sent[head - 1]) if head > 0 else "-"
 
-            tokens = sent.get("tokens", [])
-            sent_len = len(tokens)
+    out_upos.write(upos)
+    out_pos.write(pos)
+    out_baseform.write(baseform)
+    out_feats.write(feats)
+    out_ref.write(ref)
+    out_deprel.write(deprel)
+    out_dephead_ref.write(dephead_ref)
+    out_dephead.write(dephead)
 
-            for token in tokens:
-                tok_dspan = token.get("dspan", [0, 0])
-                token_segments.append((offset + tok_dspan[0], offset + tok_dspan[1]))
-
-                upos_list.append(token.get("upos") or "_")
-                pos_list.append(token.get("xpos") or "_")
-                baseform_list.append(token.get("lemma") or "_")
-                feats_list.append(token.get("feats") or "_")
-                ref_list.append(str(token.get("id", "")))
-                deprel_list.append(token.get("deprel") or "_")
-
-                head = token.get("head") or 0
-                dephead_ref_list.append(str(head) if head > 0 else "")
-                dephead_list.append(str(head - 1 + global_token_count) if head > 0 else "-")
-
-            global_token_count += sent_len
-
-        logger.progress()  # One chunk done
-
-    out_sentence.write(sentence_segments)
-    out_token.write(token_segments)
-    out_upos.write(upos_list)
-    out_pos.write(pos_list)
-    out_baseform.write(baseform_list)
-    out_feats.write(feats_list)
-    out_ref.write(ref_list)
-    out_deprel.write(deprel_list)
-    out_dephead_ref.write(dephead_ref_list)
-    out_dephead.write(dephead_list)
-
-    logger.progress()  # Write step done
+    if pretokenized:
+        logger.progress()  # Write step done
 
 
 @annotator(
     "Named entity recognition with Trankit",
-    language=["eng"],
+    language=["eng"],  # Of our languages, only English has a Trankit NER model
     preloader=_preload_pipeline,
-    preloader_params=["lang", "cache_dir", "use_gpu", "embedding"],
+    preloader_params=["lang", "cache_dir", "use_gpu", "embedding", "threads", "tok_batch_size"],
     preloader_target="pipeline",
     preloader_shared=False,
 )
 def annotate_ner(
-    corpus_text: Text = Text(),
     lang: Language = Language(),
-    sentence_chunk: Annotation = Annotation("[trankit.sentence_chunk]"),
-    out_ne: Output = Output(
-        "trankit.ne", cls="named_entity", description="Named entity segments from Trankit"
-    ),
+    word: Annotation = Annotation("<token:word>"),
+    sentence: Annotation = Annotation("<sentence>"),
+    token: Annotation = Annotation("<token>"),
     out_ne_type: Output = Output(
-        "trankit.ne:trankit.ne_type",
+        "<token>:trankit.ne_type",
         cls="token:named_entity_type",
-        description="Named entity types from Trankit",
+        description="Named entity type per token from Trankit (bare type, e.g. PER/ORG/LOC/MISC; "
+        "empty outside entities)",
+    ),
+    out_ne_part: Output = Output(
+        "<token>:trankit.ne_part",
+        description="Named entity part per token from Trankit: the BIOES position prefix "
+        "(B=begin, I=inside, E=end, S=single); empty outside entities — encodes span boundaries",
     ),
     cache_dir: str = Config("trankit.cache_dir"),
     use_gpu: bool = Config("trankit.use_gpu"),
     embedding: str = Config("trankit.embedding"),
+    threads: int = Config("trankit.threads"),
+    tok_batch_size: int = Config("trankit.tok_batch_size"),
     pipeline: object = None,
 ):
-    """Named entity recognition with Trankit (English only)."""
-    trankit_lang = _LANG_MAP.get(lang)
+    """Named entity recognition with Trankit (English only).
 
-    text_data = corpus_text.read()
-    text_spans = list(sentence_chunk.read_spans())
+    Reads the corpus tokenization (`<token>` grouped by `<sentence>`), runs only
+    Trankit's NER component, and writes two *per-token* (positional) attributes —
+    matching the Kielipankki Korp NER convention (word attributes) rather than a
+    structural span:
 
-    chunks = [
-        (text_span[0], text_data[text_span[0]:text_span[1]])
-        for text_span in text_spans
-        if text_data[text_span[0]:text_span[1]].strip()
-    ]
+    - `ne_type`: the bare entity type (e.g. "PER", "MISC").
+    - `ne_part`: the BIOES position prefix ("B"/"I"/"E"/"S"), which encodes span
+      boundaries (B/S start an entity, E/S end one).
 
-    if not chunks:
-        out_ne.write([])
-        out_ne_type.write([])
-        return
+    Both are empty for tokens outside any entity, so Korp renders them as empty
+    (a dim ∅) rather than a placeholder string.
+    """
+    sentences_all, _orphans = sentence.get_children(token)
 
-    if pipeline is None:
-        try:
-            from trankit import Pipeline
-        except ImportError:
-            raise SparvErrorMessage(
-                "Could not import trankit. Install it into the Sparv virtual environment, "
-                "or run 'sparv preload' to use the preloader."
-            )
-        logger.info("Loading Trankit pipeline for language '%s'", trankit_lang)
-        pipeline = _load_pipeline(Pipeline, trankit_lang, use_gpu, cache_dir, embedding)
+    word_list = list(word.read())
+    sentences = [s for s in sentences_all if s]
+    pretokenized = [[_model_token(word_list[i]) for i in s] for s in sentences]
 
-    logger.progress(total=len(chunks) + 1)
+    # One value per token; tokens outside any entity (and sentence-less orphans)
+    # stay empty.
+    ne_type = [""] * len(word_list)
+    ne_part = [""] * len(word_list)
 
-    ne_segments = []
-    ne_types = []
+    if pretokenized:
+        pipeline = _get_pipeline(pipeline, lang, cache_dir, use_gpu, embedding, threads, tok_batch_size)
 
-    for offset, chunk_text in chunks:
-        result = pipeline(chunk_text)
+        # Progress bar: NER tagging, writing.
+        logger.progress(total=2)
 
-        for sent in result.get("sentences", []):
-            tokens = sent.get("tokens", [])
-            ne_start = None
-            ne_type_val = None
-            for token in tokens:
-                ner_tag = token.get("ner") or "O"
-                if ner_tag.startswith("B-"):
-                    if ne_start is not None:
-                        ne_segments.append(ne_start)
-                        ne_types.append(ne_type_val)
-                    tok_dspan = token["dspan"]
-                    ne_start = (offset + tok_dspan[0], offset + tok_dspan[1])
-                    ne_type_val = ner_tag[2:]
-                elif ner_tag.startswith("I-") and ne_start is not None:
-                    tok_dspan = token["dspan"]
-                    ne_start = (ne_start[0], offset + tok_dspan[1])
-                else:
-                    if ne_start is not None:
-                        ne_segments.append(ne_start)
-                        ne_types.append(ne_type_val)
-                    ne_start = None
-                    ne_type_val = None
-            # Flush any open entity at sentence end
-            if ne_start is not None:
-                ne_segments.append(ne_start)
-                ne_types.append(ne_type_val)
-
+        ner_doc = pipeline.ner(pretokenized)["sentences"]
         logger.progress()
 
-    out_ne.write(ne_segments)
-    out_ne_type.write(ne_types)
+        for sent, ner_sent in zip(sentences, ner_doc, strict=True):
+            for w_index, w in zip(sent, ner_sent["tokens"], strict=True):
+                ner_tag = w.get("ner") or "O"
+                if ner_tag == "O":
+                    continue
+                # Trankit emits BIOES tags like "B-PER"; split into prefix + type.
+                if "-" in ner_tag:
+                    prefix, _, ne_t = ner_tag.partition("-")
+                    ne_part[w_index] = prefix
+                    ne_type[w_index] = ne_t
+                else:
+                    # Unexpected: a non-O tag without a BIOES prefix; treat as the type.
+                    ne_type[w_index] = ner_tag
 
-    logger.progress()
+    out_ne_type.write(ne_type)
+    out_ne_part.write(ne_part)
+
+    if pretokenized:
+        logger.progress()  # Write step done
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _write_empty_outputs(
-    out_sentence, out_token, out_upos, out_pos, out_baseform,
-    out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
-):
-    """Write empty annotation lists when there is no input text."""
-    for output in (
-        out_sentence, out_token, out_upos, out_pos, out_baseform,
-        out_feats, out_ref, out_deprel, out_dephead_ref, out_dephead,
-    ):
-        output.write([])
+def _clean_token_spans(text, start, end):
+    """Yield (start, end) sub-spans covering maximal runs of non-whitespace in text[start:end].
+
+    Trankit token dspans sometimes include leading/trailing whitespace (notably a
+    trailing newline in hard-wrapped source text) or even span internal whitespace.
+    Emitting such a span as a single token breaks every downstream consumer that
+    assumes a token holds no whitespace — most visibly TreeTagger, which receives
+    tokens newline-separated and would then emit more rows than it was given.
+    Splitting on whitespace here keeps `trankit.token` whitespace-free by
+    construction; an all-whitespace span yields nothing and is dropped.
+    """
+    i = start
+    while i < end:
+        while i < end and text[i].isspace():
+            i += 1
+        if i >= end:
+            break
+        run_start = i
+        while i < end and not text[i].isspace():
+            i += 1
+        yield (run_start, i)
+
+
+def _model_token(text):
+    """Return token text as fed to Trankit; it rejects empty/whitespace-only tokens."""
+    return text if text.strip() else "_"

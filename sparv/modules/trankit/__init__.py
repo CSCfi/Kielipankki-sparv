@@ -1,4 +1,4 @@
-"""POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
+"""Tokenization, POS tagging, lemmatisation, dependency parsing and NER with Trankit."""
 
 from sparv.api import Config
 
@@ -24,9 +24,28 @@ __config__ = [
         datatype=bool,
     ),
     Config(
+        "trankit.threads",
+        default=0,
+        description="Number of CPU threads Trankit may use for inference. 0 means use all "
+        "available cores. Ignored when running on GPU. Sparv runs each annotator as a "
+        "Snakemake job with OMP_NUM_THREADS=1, which would otherwise pin inference to a "
+        "single core; lower this only to avoid oversubscription when several corpora are "
+        "processed concurrently.",
+        datatype=int,
+    ),
+    Config(
         "trankit.embedding",
         default="xlm-roberta-base",
         description="XLM-RoBERTa embedding variant to use ('xlm-roberta-base' or 'xlm-roberta-large')",
         datatype=str,
+    ),
+    Config(
+        "trankit.tok_batch_size",
+        default=8,
+        description="Batch size for Trankit's tokenizer (number of ~400-token windows per "
+        "transformer forward pass). Trankit hardcodes 2 on CPU; raising it trades memory for "
+        "fewer, larger passes and may speed up tokenization, which dominates CPU runtime. "
+        "0 keeps Trankit's built-in default. Experimental — measure before relying on it.",
+        datatype=int,
     ),
 ]
